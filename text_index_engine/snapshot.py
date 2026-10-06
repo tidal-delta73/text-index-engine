@@ -146,40 +146,101 @@ class Snapshot:
         if not isinstance(doc_ids, list) or not isinstance(terms, list):
             raise DataError("snapshot: 'documents' and 'terms' must be arrays")
 
-        seen: set[str] = set()
+        previous_id = None
         for doc_id in doc_ids:
-            if not isinstance(doc_id, str):
-                raise DataError("snapshot: document ids must be strings")
-            if doc_id in seen:
-                raise DataError(f"snapshot: duplicate document id {doc_id!r}")
-            seen.add(doc_id)
+            if not isinstance(doc_id, str) or doc_id == "":
+                raise DataError(
+                    "snapshot: document ids must be non-empty strings")
+            if previous_id is not None and doc_id <= previous_id:
+                if doc_id == previous_id:
+                    raise DataError(
+                        f"snapshot: duplicate document id {doc_id!r}")
+                raise DataError(
+                    "snapshot: document ids are not strictly increasing "
+                    "by code point")
+            previous_id = doc_id
+        known_docs = set(doc_ids)
 
         postings: dict[str, dict[str, list[int]]] = {}
+        # doc id -> position -> term occupying it. Presence in this dict also
+        # marks documents that contain at least one token.
+        doc_positions: dict[str, dict[int, str]] = {}
+        previous_term = None
         for entry in terms:
             if (not isinstance(entry, dict)
                     or not isinstance(entry.get("term"), str)
                     or not isinstance(entry.get("postings"), list)):
                 raise DataError("snapshot: malformed term entry")
             term = entry["term"]
-            if term in postings:
-                raise DataError(f"snapshot: duplicate term {term!r}")
+            if term == "":
+                raise DataError("snapshot: term must be non-empty")
+            if tokenize(term) != [term]:
+                raise DataError(
+                    f"snapshot: term {term!r} is not a single normalized term")
+            if previous_term is not None and term <= previous_term:
+                if term == previous_term:
+                    raise DataError(f"snapshot: duplicate term {term!r}")
+                raise DataError(
+                    "snapshot: terms are not strictly increasing by code point")
+            previous_term = term
+            if not entry["postings"]:
+                raise DataError(f"snapshot: term {term!r} has no postings")
+
             term_postings: dict[str, list[int]] = {}
+            previous_doc = None
             for p in entry["postings"]:
                 if (not isinstance(p, dict)
                         or not isinstance(p.get("id"), str)
                         or not isinstance(p.get("positions"), list)):
                     raise DataError("snapshot: malformed posting")
+                doc_id = p["id"]
+                if doc_id not in known_docs:
+                    raise DataError(
+                        f"snapshot: posting references unknown document {doc_id!r}")
+                if previous_doc is not None and doc_id <= previous_doc:
+                    if doc_id == previous_doc:
+                        raise DataError(
+                            f"snapshot: duplicate posting for {term!r}/{doc_id!r}")
+                    raise DataError(
+                        f"snapshot: postings for {term!r} are not strictly "
+                        "increasing by code point")
+                previous_doc = doc_id
+
                 positions = p["positions"]
-                if not all(isinstance(x, int) and not isinstance(x, bool)
-                           and x >= 0 for x in positions):
-                    raise DataError("snapshot: positions must be non-negative integers")
-                if p["id"] not in seen:
+                if not positions:
                     raise DataError(
-                        f"snapshot: posting references unknown document {p['id']!r}")
-                if p["id"] in term_postings:
-                    raise DataError(
-                        f"snapshot: duplicate posting for {term!r}/{p['id']!r}")
-                term_postings[p["id"]] = positions
+                        f"snapshot: empty positions for {term!r}/{doc_id!r}")
+                previous_pos = None
+                for x in positions:
+                    if not isinstance(x, int) or isinstance(x, bool) or x < 0:
+                        raise DataError(
+                            "snapshot: positions must be non-negative integers")
+                    if previous_pos is not None and x <= previous_pos:
+                        raise DataError(
+                            f"snapshot: positions for {term!r}/{doc_id!r} "
+                            "must be strictly increasing")
+                    previous_pos = x
+
+                # Each token position belongs to exactly one term.
+                occupied = doc_positions.setdefault(doc_id, {})
+                for x in positions:
+                    other = occupied.get(x)
+                    if other is not None:
+                        raise DataError(
+                            f"snapshot: position {x} in document {doc_id!r} "
+                            f"is claimed by both {other!r} and {term!r}")
+                    occupied[x] = term
+
+                term_postings[doc_id] = positions
             postings[term] = term_postings
+
+        # Tokenized documents cover every position 0..max exactly once;
+        # documents absent from doc_positions are empty-text documents.
+        for doc_id, occupied in doc_positions.items():
+            max_pos = max(occupied)
+            if len(occupied) != max_pos + 1:
+                raise DataError(
+                    f"snapshot: positions in document {doc_id!r} are not a "
+                    "contiguous run starting at 0")
 
         return cls(list(doc_ids), postings)

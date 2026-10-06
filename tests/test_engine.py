@@ -174,6 +174,152 @@ class SnapshotLoadTests(unittest.TestCase):
         with self.assertRaises(DataError):
             Snapshot.load(b"\xff\xfe")
 
+    def base_obj(self, docs=None):
+        return json.loads(build_from_lines(lines(
+            DOCS if docs is None else docs)))
+
+    def assert_rejected(self, obj):
+        with self.assertRaises(DataError):
+            Snapshot.load(json.dumps(obj, ensure_ascii=False))
+
+    def test_built_snapshots_accepted(self):
+        # Normal set, empty set, only empty-text docs, unicode ids/terms.
+        Snapshot.load(build_from_lines(lines(DOCS)))
+        Snapshot.load(build_from_lines([]))
+        empty_only = [
+            {"id": "a", "text": ""},
+            {"id": "中", "text": "   !  "},
+        ]
+        Snapshot.load(build_from_lines(lines(empty_only)))
+        unicode_docs = [{"id": "中", "text": "快狐 跳过"}]
+        Snapshot.load(build_from_lines(lines(unicode_docs)))
+
+    def test_document_ids(self):
+        obj = self.base_obj()
+        obj["documents"].append("")
+        self.assert_rejected(obj)
+
+        obj = self.base_obj()
+        obj["documents"].append("a")
+        self.assert_rejected(obj)
+
+        obj = self.base_obj()
+        obj["documents"] = ["b", "a"]
+        self.assert_rejected(obj)
+
+        obj = self.base_obj()
+        obj["documents"] = ["a", 1]
+        self.assert_rejected(obj)
+
+    def test_terms_sorted_and_self_normalizing(self):
+        obj = self.base_obj()
+        obj["terms"] = list(reversed(obj["terms"]))
+        self.assert_rejected(obj)
+
+        obj = self.base_obj()
+        obj["terms"][0]["term"] = "FOX"  # tokenize("FOX") == ["fox"]
+        self.assert_rejected(obj)
+
+        obj = self.base_obj()
+        obj["terms"][0]["term"] = ""
+        self.assert_rejected(obj)
+
+        obj = self.base_obj()
+        obj["terms"][0]["term"] = "quick fox"  # splits into two tokens
+        self.assert_rejected(obj)
+
+        obj = self.base_obj()
+        obj["terms"] = [dict(obj["terms"][0]), dict(obj["terms"][0])]
+        self.assert_rejected(obj)
+
+    def test_postings(self):
+        obj = self.base_obj()
+        term = next(t for t in obj["terms"] if t["term"] == "quick")
+        term["postings"] = []
+        self.assert_rejected(obj)
+
+        obj = self.base_obj()
+        term = next(t for t in obj["terms"] if t["term"] == "quick")
+        term["postings"][0]["positions"] = []
+        self.assert_rejected(obj)
+
+        obj = self.base_obj()
+        term = next(t for t in obj["terms"] if t["term"] == "quick")
+        term["postings"] = list(reversed(term["postings"]))
+        self.assert_rejected(obj)
+
+        obj = self.base_obj()
+        term = next(t for t in obj["terms"] if t["term"] == "quick")
+        term["postings"].append(dict(term["postings"][0]))
+        self.assert_rejected(obj)
+
+        obj = self.base_obj()
+        term = next(t for t in obj["terms"] if t["term"] == "quick")
+        term["postings"][0]["id"] = "ghost"
+        self.assert_rejected(obj)
+
+    def test_positions(self):
+        obj = self.base_obj()
+        term = next(t for t in obj["terms"] if t["term"] == "quick")
+        term["postings"][1]["positions"] = [5, 1]  # out of order
+        self.assert_rejected(obj)
+
+        obj = self.base_obj()
+        term = next(t for t in obj["terms"] if t["term"] == "quick")
+        term["postings"][1]["positions"] = [1, 1]  # duplicate
+        self.assert_rejected(obj)
+
+        obj = self.base_obj()
+        term = next(t for t in obj["terms"] if t["term"] == "quick")
+        term["postings"][0]["positions"] = [True]
+        self.assert_rejected(obj)
+
+        obj = self.base_obj()
+        term = next(t for t in obj["terms"] if t["term"] == "quick")
+        term["postings"][0]["positions"] = [-1]
+        self.assert_rejected(obj)
+
+    def test_per_document_consistency(self):
+        # Position hole: drop the term covering position 0 of a 3-token doc.
+        hole = json.loads(build_from_lines(
+            lines([{"id": "d", "text": "x y z"}])))
+        hole["terms"] = [t for t in hole["terms"] if t["term"] != "x"]
+        self.assert_rejected(hole)
+
+        # Union must start at 0: only position 1 present is not buildable.
+        gap = json.loads(build_from_lines(
+            lines([{"id": "d", "text": "x y"}])))
+        xt = next(t for t in gap["terms"] if t["term"] == "x")
+        xt["postings"][0]["positions"] = [2]
+        self.assert_rejected(gap)
+
+        # Same position claimed by two terms is not buildable.
+        coll = json.loads(build_from_lines(
+            lines([{"id": "d", "text": "one two"}])))
+        two = next(t for t in coll["terms"] if t["term"] == "two")
+        two["postings"][0]["positions"] = [0]  # collides with "one"
+        self.assert_rejected(coll)
+
+        # Snapshot records no original text, so the loader identifies empty
+        # documents structurally: a posting covering 0..max makes the doc a
+        # legitimate one-token document (buildable from other input text)...
+        obj = self.base_obj()
+        term = next(t for t in obj["terms"] if t["term"] == "quick")
+        term["postings"].append({"id": "c", "positions": [0]})
+        term["postings"].sort(key=lambda p: p["id"])
+        Snapshot.load(json.dumps(obj, ensure_ascii=False))
+        # ...but a non-contiguous fabricated posting is still rejected.
+        term["postings"][-1]["positions"] = [1]
+        self.assert_rejected(obj)
+
+    def test_empty_positions_does_not_match(self):
+        # A posting whose positions list is empty must be rejected outright
+        # rather than silently matching the document.
+        obj = self.base_obj()
+        term = next(t for t in obj["terms"] if t["term"] == "fox")
+        term["postings"][0]["positions"] = []
+        self.assert_rejected(obj)
+
 
 class CliTests(unittest.TestCase):
     def setUp(self):
