@@ -43,9 +43,21 @@ precedence `NOT` > `AND` > `OR`; there is no implicit operator.
 | Syntax        | Meaning                                              |
 |---------------|------------------------------------------------------|
 | `foo`         | term (normalized/tokenized like indexed text)        |
+| `app*`        | term prefix: all terms starting with `app`           |
 | `"new york"`  | phrase: all terms consecutive in one document        |
 | `AND OR NOT`  | boolean operators (uppercase only)                   |
 | `( ... )`     | grouping                                             |
+
+In `app*` the text before the star is analyzed with the same NFKC
+normalization and casefolding as a plain term; it must analyze to exactly
+one non-empty token. The query then matches every dictionary term with that
+normalized token as a code-point prefix (no extra tokenization, stemming or
+locale comparison), and a prefix with no matching terms matches nothing.
+The star is meaningful only at the end of a bare term — `*` alone, several
+stars, a star before the term's end, or a prefix body that tokenizes to
+zero or several terms is a query error; inside quoted phrases `*` is
+literal. `AND*`, `OR*` and `NOT*` are prefix terms, while bare `AND`, `OR`
+and `NOT` remain operators.
 
 `NOT`'s universe is every document in the snapshot. An empty query prints
 `[]`. Search reads only the snapshot — never the original documents — and
@@ -56,6 +68,7 @@ Examples:
 ```bash
 python3 -m text_index_engine search idx.snap 'fox AND NOT "lazy dog"'
 python3 -m text_index_engine search idx.snap '(quick OR fast) AND fox'
+python3 -m text_index_engine search idx.snap 'bro* OR app*'
 ```
 
 ## Exit codes
