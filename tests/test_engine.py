@@ -93,6 +93,99 @@ class BuildTests(unittest.TestCase):
         self.assert_data_error([good, good], "duplicate")
 
 
+class StreamingBuildTests(unittest.TestCase):
+    """build_from_lines consumes any one-shot iterable in a single pass."""
+
+    # Canonical bytes produced by the pre-refactor builder for DOCS; the
+    # streaming builder must reproduce them exactly.
+    CANONICAL = (
+        b'{"version":1,"documents":["a","b","c","d","\xe4\xb8\xad"],'
+        b'"terms":['
+        b'{"term":"a","postings":[{"id":"b","positions":[0,4]}]},'
+        b'{"term":"and","postings":[{"id":"b","positions":[3]}]},'
+        b'{"term":"brown","postings":[{"id":"a","positions":[2]}]},'
+        b'{"term":"caf\xc3\xa9","postings":[{"id":"d","positions":[0,1]}]},'
+        b'{"term":"dog","postings":[{"id":"a","positions":[8]},'
+        b'{"id":"b","positions":[6]}]},'
+        b'{"term":"file","postings":[{"id":"d","positions":[2]}]},'
+        b'{"term":"fox","postings":[{"id":"a","positions":[3]},'
+        b'{"id":"b","positions":[2]}]},'
+        b'{"term":"jumps","postings":[{"id":"a","positions":[4]}]},'
+        b'{"term":"lazy","postings":[{"id":"a","positions":[7]}]},'
+        b'{"term":"over","postings":[{"id":"a","positions":[5]}]},'
+        b'{"term":"quick","postings":[{"id":"a","positions":[1]},'
+        b'{"id":"b","positions":[1,5]},{"id":"\xe4\xb8\xad","positions":[3]}]},'
+        b'{"term":"the","postings":[{"id":"a","positions":[0,6]}]},'
+        b'{"term":"\xe5\xbf\xab\xe7\x8b\x90","postings":'
+        b'[{"id":"\xe4\xb8\xad","positions":[0]}]},'
+        b'{"term":"\xe6\x87\x92\xe7\x8b\x97","postings":'
+        b'[{"id":"\xe4\xb8\xad","positions":[2]}]},'
+        b'{"term":"\xe8\xb7\xb3\xe8\xbf\x87","postings":'
+        b'[{"id":"\xe4\xb8\xad","positions":[1]}]}]}\n'
+    )
+
+    class OneShot:
+        """Iterable without len/indexing that forbids a second traversal."""
+
+        def __init__(self, items):
+            self._items = items
+            self.used = False
+
+        def __iter__(self):
+            if self.used:
+                raise AssertionError("input was iterated twice")
+            self.used = True
+            return iter(self._items)
+
+        def __len__(self):
+            raise AssertionError("input must not be measured")
+
+        def __getitem__(self, index):
+            raise AssertionError("input must not be indexed")
+
+    def test_matches_pre_refactor_canonical_bytes(self):
+        self.assertEqual(build_from_lines(lines(DOCS)), self.CANONICAL)
+
+    def test_one_shot_generator_input(self):
+        result = build_from_lines(line for line in lines(DOCS))
+        self.assertEqual(result, self.CANONICAL)
+
+    def test_one_shot_iterable_without_len_or_indexing(self):
+        source = self.OneShot(lines(DOCS))
+        self.assertEqual(build_from_lines(source), self.CANONICAL)
+        self.assertTrue(source.used)
+
+    def test_shuffled_corpus_with_empty_documents(self):
+        shuffled = [DOCS[4], DOCS[2], DOCS[0], DOCS[3], DOCS[1]]
+        empties = [{"id": "e", "text": ""}, {"id": "f", "text": "  - ! "}]
+        mixed = lines(shuffled[:2] + empties + shuffled[2:])
+        again = lines(empties[::-1] + shuffled)
+        self.assertEqual(build_from_lines(self.OneShot(mixed)),
+                         build_from_lines(self.OneShot(again)))
+        obj = json.loads(build_from_lines(mixed))
+        # Empty/separator-only documents are indexed with no postings.
+        self.assertEqual(obj["documents"], ["a", "b", "c", "d", "e", "f", "中"])
+        referenced = {p["id"] for t in obj["terms"] for p in t["postings"]}
+        self.assertNotIn("e", referenced)
+        self.assertNotIn("f", referenced)
+
+    def test_duplicate_id_in_one_shot_stream(self):
+        good = json.dumps({"id": "x", "text": "hello"}) + "\n"
+        stream = self.OneShot([good, good])
+        with self.assertRaises(DataError) as ctx:
+            build_from_lines(stream)
+        self.assertIn("line 2", str(ctx.exception))
+        self.assertIn("duplicate", str(ctx.exception))
+
+    def test_trailing_bad_line_in_one_shot_stream(self):
+        docs = lines(DOCS)
+        stream = self.OneShot(docs + ["{not json\n"])
+        with self.assertRaises(DataError) as ctx:
+            build_from_lines(stream)
+        self.assertIn(f"line {len(docs) + 1}", str(ctx.exception))
+        # No partial bytes: the failure raises instead of returning.
+
+
 class SearchTests(unittest.TestCase):
     def setUp(self):
         self.snap = Snapshot.load(build_from_lines(lines(DOCS)))

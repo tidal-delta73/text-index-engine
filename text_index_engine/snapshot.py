@@ -35,10 +35,16 @@ def build_from_lines(lines) -> bytes:
     Each line must be a JSON object with non-empty unique string ``id`` and
     string ``text``. Raises DataError on any validation failure; nothing is
     written until the whole input has been validated.
+
+    ``lines`` may be any one-shot iterable: it is consumed in a single
+    forward pass and never required to support len, indexing or a second
+    traversal. Each document's tokens are folded straight into the inverted
+    index and then dropped, so auxiliary memory grows only with the final
+    index, never with a second copy of every document's tokens.
     """
-    # id -> tokens (dict also doubles as insertion-ordered duplicate check).
-    documents: dict[str, list[str]] = {}
     seen_ids: set[str] = set()
+    # term -> doc id -> positions (the final logical index, built in place).
+    terms: dict[str, dict[str, list[int]]] = {}
 
     for lineno, line in enumerate(lines, start=1):
         try:
@@ -62,18 +68,13 @@ def build_from_lines(lines) -> bytes:
         if doc_id in seen_ids:
             raise DataError(f"line {lineno}: duplicate id {doc_id!r}")
         seen_ids.add(doc_id)
-        documents[doc_id] = tokenize(text)
-
-    return _encode(_build_object(documents))
-
-
-def _build_object(documents: dict[str, list[str]]):
-    # term -> doc id -> positions
-    terms: dict[str, dict[str, list[int]]] = {}
-    for doc_id, tokens in documents.items():
-        for position, term in enumerate(tokens):
+        for position, term in enumerate(tokenize(text)):
             terms.setdefault(term, {}).setdefault(doc_id, []).append(position)
 
+    return _encode(_build_object(seen_ids, terms))
+
+
+def _build_object(doc_ids, terms: dict[str, dict[str, list[int]]]):
     term_objs = []
     for term in sorted(terms):
         postings = terms[term]
@@ -87,7 +88,7 @@ def _build_object(documents: dict[str, list[str]]):
 
     return {
         "version": SNAPSHOT_VERSION,
-        "documents": sorted(documents),
+        "documents": sorted(doc_ids),
         "terms": term_objs,
     }
 
