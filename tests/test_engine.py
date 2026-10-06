@@ -160,6 +160,188 @@ class SearchTests(unittest.TestCase):
         self.assert_rejected("fox AND (dog OR)")
 
 
+class PrefixQueryTests(unittest.TestCase):
+    def setUp(self):
+        self.snap = Snapshot.load(build_from_lines(lines(DOCS)))
+
+    def run_query(self, q):
+        node = query.parse(q)
+        return sorted(query.evaluate(node, self.snap))
+
+    def test_prefix_ast_shape(self):
+        self.assertEqual(query.parse("app*"), ("prefix", "app"))
+
+    def test_prefix_matches_every_term_starting_with_it(self):
+        # "quick" appears in a, b and 中.
+        self.assertEqual(self.run_query("qu*"), ["a", "b", "中"])
+        # fox -> a,b and file -> d both start with "f".
+        self.assertEqual(self.run_query("f*"), ["a", "b", "d"])
+        # An exact-word prefix behaves like the plain term.
+        self.assertEqual(self.run_query("dog*"), ["a", "b"])
+        # Single-character prefix.
+        self.assertEqual(self.run_query("l*"), ["a"])
+        # Prefix of a term that exists only alongside longer words.
+        self.assertEqual(self.run_query("caf"), [])      # no wildcard: term
+        self.assertEqual(self.run_query("caf*"), ["d"])  # café
+
+    def test_prefix_is_normalized_like_terms(self):
+        self.assertEqual(self.run_query("QU*"), ["a", "b", "中"])  # casefold
+        self.assertEqual(self.run_query("CAF*"), ["d"])            # casefold
+        self.assertEqual(self.run_query("ﬁ*"), ["d"])              # fi -> file
+        # Fullwidth ASCII NFKC-folds to plain letters before prefixing.
+        self.assertEqual(
+            sorted(query.evaluate(
+                query.parse("ＱＵ*"), self.snap)),
+            ["a", "b", "中"],
+        )
+
+    def test_cjk_prefix_is_codepoint_prefix(self):
+        self.assertEqual(self.run_query("快*"), ["中"])   # 快狐
+        self.assertEqual(self.run_query("懒*"), ["中"])   # 懒狗
+        self.assertEqual(self.run_query("狐*"), [])       # second codepoint only
+
+    def test_prefix_with_no_matching_term_is_empty_set(self):
+        self.assertEqual(self.run_query("zzz*"), [])
+        # NFKC of ① is "1", which prefixes no indexed term either.
+        self.assertEqual(self.run_query("①*"), [])
+
+    def test_prefix_in_boolean_combinations(self):
+        self.assertEqual(self.run_query("qu* AND fox"), ["a", "b"])
+        self.assertEqual(self.run_query("qu* OR café"), ["a", "b", "d", "中"])
+        self.assertEqual(self.run_query("NOT qu*"), ["c", "d"])
+        self.assertEqual(
+            self.run_query("(qu* OR laz*) AND dog"), ["a", "b"])
+        self.assertEqual(self.run_query("zzz* OR fox"), ["a", "b"])
+        self.assertEqual(self.run_query("fox AND zzz*"), [])
+        # NOT over a matching/non-matching prefix; empty-text doc c included.
+        self.assertEqual(
+            self.run_query("NOT f*"), ["c", "中"])
+        self.assertEqual(
+            self.run_query("NOT zzz*"), ["a", "b", "c", "d", "中"])
+        self.assertEqual(self.run_query("NOT NOT*"),
+                         ["a", "b", "c", "d", "中"])
+        self.assertEqual(self.run_query("(qu*)"), ["a", "b", "中"])
+
+    def test_starred_keywords_are_prefix_terms(self):
+        # "and" is an ordinary word in document b.
+        self.assertEqual(self.run_query("AND*"), ["b"])
+        self.assertEqual(self.run_query("and*"), ["b"])
+        # No term begins with "or"/"not" in this corpus.
+        self.assertEqual(self.run_query("OR*"), [])
+        self.assertEqual(self.run_query("NOT*"), [])
+        # Bare uppercase keywords keep their operator meaning.
+        with self.assertRaises(DataError):
+            query.parse("AND fox")
+        # A starred keyword still composes as an operand.
+        self.assertEqual(self.run_query("NOT AND*"),
+                         ["a", "c", "d", "中"])
+
+    def test_star_inside_phrase_has_no_wildcard_meaning(self):
+        # Tokenized by ordinary phrase rules: the star is punctuation, and
+        # the resulting one-word phrase matches like the bare phrase.
+        self.assertEqual(self.run_query('"quick*"'), ["a", "b", "中"])
+        # "dog*fox" phrase-analyzes to two words that are not consecutive.
+        self.assertEqual(self.run_query('"dog*fox"'), [])
+        # A lone star inside quotes is still a phrase with no searchable term.
+        with self.assertRaises(DataError):
+            query.parse('"*"')
+
+    def test_prefix_adjacency_without_operator_rejected(self):
+        for q in ("fox qu*", "qu* fox", '"quick fox" qu*', 'qu* "fox"',
+                  "qu* dog*"):
+            with self.assertRaises(DataError):
+                query.parse(q)
+
+    def assert_rejected(self, q):
+        with self.assertRaises(DataError) as ctx:
+            node = query.parse(q)
+            query.evaluate(node, self.snap)
+        self.assertTrue(str(ctx.exception).startswith("query:"))
+
+    def test_illegal_star_forms_rejected(self):
+        # Lone star.
+        self.assert_rejected("*")
+        # More than one star / star not trailing the bare term.
+        self.assert_rejected("**")
+        self.assert_rejected("foo**")
+        self.assert_rejected("*foo")
+        self.assert_rejected("foo*bar")
+        self.assert_rejected("fo*o*")
+        self.assert_rejected("a*b*")
+        # Star separated by whitespace is a lone-star run.
+        self.assert_rejected("foo *")
+        self.assert_rejected("* foo")
+        # Prefix body analyzes to zero terms.
+        self.assert_rejected("!!!*")
+        self.assert_rejected("-*")
+        # Prefix body analyzes to several terms inside one bare run.
+        self.assert_rejected("foo,bar*")
+        self.assert_rejected("quick-fox*")
+        # A star dangling after a closing paren is its own bad run.
+        self.assert_rejected("(fox)*")
+
+
+class PrefixSnapshotTests(unittest.TestCase):
+    def test_prefix_results_independent_of_document_input_order(self):
+        # Build equivalent snapshots from different input orders; prefix
+        # queries must return identical, sorted hit sets against each one.
+        orders = [
+            DOCS,
+            list(reversed(DOCS)),
+            DOCS[2:] + DOCS[:2],
+        ]
+        snaps = [Snapshot.load(build_from_lines(lines(order)))
+                 for order in orders]
+        # The snapshots themselves are byte-identical already, but the
+        # guarantee asked for is identical *query results*:
+        self.assertTrue(all(
+            build_from_lines(lines(order)) == build_from_lines(lines(DOCS))
+            for order in orders))
+        prefix_queries = [
+            "qu*", "f*", "caf*", "快*", "zzz*",
+            "NOT f*", "qu* AND fox", "(qu* OR laz*) AND dog",
+        ]
+        for q in prefix_queries:
+            results = [
+                sorted(query.evaluate(query.parse(q), snap))
+                for snap in snaps
+            ]
+            self.assertEqual(results[0], results[1], q)
+            self.assertEqual(results[0], results[2], q)
+
+    def test_old_v1_snapshot_needs_no_rebuild(self):
+        # A hand-written v1 snapshot (same format build has always emitted)
+        # must serve prefix queries without any migration or rebuild.
+        obj = {
+            "version": 1,
+            "documents": ["d1", "d2"],
+            "terms": [
+                {"term": "app",
+                 "postings": [{"id": "d1", "positions": [0]}]},
+                {"term": "apple",
+                 "postings": [{"id": "d2", "positions": [0]}]},
+                {"term": "banana",
+                 "postings": [{"id": "d1", "positions": [1]}]},
+            ],
+        }
+        snap = Snapshot.load(json.dumps(obj, ensure_ascii=False))
+        self.assertEqual(
+            sorted(query.evaluate(query.parse("app*"), snap)),
+            ["d1", "d2"],
+        )
+        self.assertEqual(
+            sorted(query.evaluate(query.parse("APP*"), snap)),
+            ["d1", "d2"],
+        )
+        self.assertEqual(
+            sorted(query.evaluate(query.parse("b*"), snap)), ["d1"])
+        self.assertEqual(
+            sorted(query.evaluate(query.parse("appz*"), snap)), [])
+        # Plain term behavior on the same snapshot is untouched.
+        self.assertEqual(
+            sorted(query.evaluate(query.parse("app"), snap)), ["d1"])
+
+
 class SnapshotLoadTests(unittest.TestCase):
     def _obj(self, docs=DOCS):
         return json.loads(build_from_lines(lines(docs)))
@@ -442,6 +624,35 @@ class CliTests(unittest.TestCase):
         _, out, _ = self.run_cli("search", self.snap_path, "NOT café")
         # Everything but d; "中" comes after ASCII ids.
         self.assertEqual(json.loads(out), ["a", "b", "c", "中"])
+
+    def test_prefix_search_cli(self):
+        self.run_cli("build", self.docs_path, self.snap_path)
+        code, out, err = self.run_cli("search", self.snap_path, "qu*")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out), ["a", "b", "中"])
+        self.assertTrue(out.endswith("\n"))
+
+    def test_prefix_search_byte_stable(self):
+        self.run_cli("build", self.docs_path, self.snap_path)
+        _, out1, _ = self.run_cli("search", self.snap_path, "f*")
+        _, out2, _ = self.run_cli("search", self.snap_path, "f*")
+        self.assertEqual(out1, out2)
+        self.assertEqual(out1, '["a","b","d"]\n')
+
+    def test_prefix_no_match_prints_empty_array(self):
+        self.run_cli("build", self.docs_path, self.snap_path)
+        code, out, err = self.run_cli("search", self.snap_path, "nope*")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out, "[]\n")
+
+    def test_prefix_query_error_exit_2_no_partial_output(self):
+        self.run_cli("build", self.docs_path, self.snap_path)
+        for bad in ("*", "foo**", "*foo", "foo*bar", "!!!*", "foo,bar*",
+                    "qu* fox"):
+            code, out, err = self.run_cli("search", self.snap_path, bad)
+            self.assertEqual(code, 2, bad)
+            self.assertEqual(out, "", bad)
+            self.assertTrue(err.splitlines()[0].startswith("error:"), bad)
 
 
 if __name__ == "__main__":

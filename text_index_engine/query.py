@@ -5,19 +5,26 @@ Grammar (explicit operators only, no implicit conjunction)::
     or_expr  := and_expr (OR and_expr)*
     and_expr := not_expr (AND not_expr)*
     not_expr := NOT not_expr | atom
-    atom     := TERM | PHRASE | LPAREN or_expr RPAREN
+    atom     := TERM | PREFIX | PHRASE | LPAREN or_expr RPAREN
 
 Precedence is NOT > AND > OR. AND/OR/NOT are keywords only when written in
 exact uppercase; lowercase forms are ordinary search terms. Query terms and
 phrase terms go through the same normalization/tokenization as the indexed
-text. Evaluation operates on sets of document ids; NOT's universe is the
-full document set recorded in the snapshot.
+text. A prefix term is a bare term immediately followed by one ``*``
+(e.g. ``app*``): the text before the star is normalized/tokenized like an
+ordinary term and must yield exactly one non-empty token, and the star may
+only appear as the final character of a bare run. Evaluation unions the
+postings of every dictionary term that starts with the normalized prefix,
+compared codepoint by codepoint with no further tokenization, stemming or
+locale collation. Evaluation operates on sets of document ids; NOT's
+universe is the full document set recorded in the snapshot.
 """
 from .analysis import tokenize
 from .errors import DataError
 
 # Token kinds
 T_TERM = "TERM"
+T_PREFIX = "PREFIX"
 T_PHRASE = "PHRASE"
 T_AND = "AND"
 T_OR = "OR"
@@ -72,6 +79,21 @@ def _lex(query: str) -> list[_Token]:
         while i < n and not query[i].isspace() and query[i] not in '()"':
             i += 1
         run = query[start:i]
+        if "*" in run:
+            # A star is legal only as the single trailing character of a
+            # bare prefix term. AND*/OR*/NOT* take this path too: a starred
+            # keyword is a prefix term, while bare AND/OR/NOT stay operators.
+            if run.count("*") != 1 or not run.endswith("*"):
+                raise DataError(
+                    f"query: prefix {run!r} must be a single term followed "
+                    f"by one trailing '*'")
+            words = tokenize(run[:-1])
+            if len(words) != 1:
+                raise DataError(
+                    f"query: prefix {run!r} must contain exactly one "
+                    f"non-empty searchable term")
+            tokens.append(_Token(T_PREFIX, words[0]))
+            continue
         kind = _KEYWORDS.get(run)
         if kind is not None:
             tokens.append(_Token(kind, run))
@@ -139,6 +161,9 @@ class _Parser:
         if tok.kind == T_TERM:
             self._advance()
             return ("term", tok.value)
+        if tok.kind == T_PREFIX:
+            self._advance()
+            return ("prefix", tok.value)
         if tok.kind == T_PHRASE:
             self._advance()
             return ("phrase", tok.value)
@@ -191,12 +216,27 @@ def _phrase_docs(snapshot, words: list[str]) -> set[str]:
     return hits
 
 
+def _prefix_docs(snapshot, prefix: str) -> set[str]:
+    """Union of postings of every term starting with ``prefix``.
+
+    The match is a plain codepoint prefix test on the normalized dictionary
+    terms; an absent match yields the empty set.
+    """
+    hits: set[str] = set()
+    for term, posting in snapshot.postings.items():
+        if term.startswith(prefix):
+            hits.update(posting)
+    return hits
+
+
 def evaluate(node, snapshot) -> set[str]:
     kind = node[0]
     universe = snapshot.all_docs
     if kind == "term":
         posting = snapshot.postings.get(node[1])
         return set(posting) if posting is not None else set()
+    if kind == "prefix":
+        return _prefix_docs(snapshot, node[1])
     if kind == "phrase":
         return _phrase_docs(snapshot, node[1])
     if kind == "not":

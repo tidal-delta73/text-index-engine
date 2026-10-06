@@ -43,9 +43,21 @@ precedence `NOT` > `AND` > `OR`; there is no implicit operator.
 | Syntax        | Meaning                                              |
 |---------------|------------------------------------------------------|
 | `foo`         | term (normalized/tokenized like indexed text)        |
+| `foo*`        | prefix: every dictionary term starting with `foo`    |
 | `"new york"`  | phrase: all terms consecutive in one document        |
 | `AND OR NOT`  | boolean operators (uppercase only)                   |
 | `( ... )`     | grouping                                             |
+
+A prefix is written as a bare term immediately followed by one `*` (e.g.
+`app*`). The text before the star is normalized/tokenized like an ordinary
+term and must analyze to exactly one non-empty term; every snapshot term
+starting with that normalized string contributes its documents. Matching is a
+codepoint-by-codepoint prefix on normalized Unicode strings — no extra
+tokenization, stemming or locale collation, and a prefix with no matching
+term matches nothing. A lone `*`, more than one `*`, or a `*` anywhere but
+the end of a bare term is a query error; `AND*`/`OR*`/`NOT*` are prefix
+terms, while bare uppercase `AND`/`OR`/`NOT` stay operators. Inside quoted
+phrases `*` has no wildcard meaning.
 
 `NOT`'s universe is every document in the snapshot. An empty query prints
 `[]`. Search reads only the snapshot — never the original documents — and
@@ -56,6 +68,7 @@ Examples:
 ```bash
 python3 -m text_index_engine search idx.snap 'fox AND NOT "lazy dog"'
 python3 -m text_index_engine search idx.snap '(quick OR fast) AND fox'
+python3 -m text_index_engine search idx.snap 'NOT app* OR "new york"'
 ```
 
 ## Exit codes
