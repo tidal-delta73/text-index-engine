@@ -161,9 +161,15 @@ class SearchTests(unittest.TestCase):
 
 
 class SnapshotLoadTests(unittest.TestCase):
+    def _obj(self, docs=DOCS):
+        return json.loads(build_from_lines(lines(docs)))
+
+    def assert_rejected(self, obj):
+        with self.assertRaises(DataError):
+            Snapshot.load(json.dumps(obj, ensure_ascii=False))
+
     def test_unsupported_version(self):
-        raw = bytearray(build_from_lines(lines(DOCS)))
-        obj = json.loads(raw)
+        obj = self._obj()
         obj["version"] = 999
         with self.assertRaises(DataError):
             Snapshot.load(json.dumps(obj))
@@ -173,6 +179,113 @@ class SnapshotLoadTests(unittest.TestCase):
             Snapshot.load(b"not json")
         with self.assertRaises(DataError):
             Snapshot.load(b"\xff\xfe")
+
+    def test_built_snapshots_accepted(self):
+        # The ordinary corpus, including an empty-text document.
+        Snapshot.load(build_from_lines(lines(DOCS)))
+        # Empty document set.
+        Snapshot.load(build_from_lines([]))
+        # A document set consisting only of empty-text documents.
+        Snapshot.load(build_from_lines(lines([
+            {"id": "x", "text": ""},
+            {"id": "y", "text": "   - ! "},
+        ])))
+        # Unicode document ids and terms, and a term repeated within a doc.
+        Snapshot.load(build_from_lines(lines([
+            {"id": "中", "text": "快狐 跳过 快狐 quick"},
+        ])))
+
+    def test_document_id_rules(self):
+        self.assert_rejected({"version": 1, "documents": [1], "terms": []})
+        self.assert_rejected({"version": 1, "documents": [""], "terms": []})
+        self.assert_rejected(
+            {"version": 1, "documents": ["b", "a"], "terms": []})
+        self.assert_rejected(
+            {"version": 1, "documents": ["a", "a"], "terms": []})
+
+    def _one_term(self, term, positions, docs=("d",)):
+        return {"version": 1, "documents": list(docs), "terms": [
+            {"term": term,
+             "postings": [{"id": docs[0], "positions": positions}]}]}
+
+    def test_term_rules(self):
+        # Non-empty, strictly increasing/unique, analyzer-stable.
+        self.assert_rejected(self._one_term("", [0]))
+        self.assert_rejected({"version": 1, "documents": ["d"], "terms": [
+            {"term": "b", "postings": [{"id": "d", "positions": [0]}]},
+            {"term": "a", "postings": [{"id": "d", "positions": [1]}]},
+        ]})
+        self.assert_rejected({"version": 1, "documents": ["d"], "terms": [
+            {"term": "a", "postings": [{"id": "d", "positions": [0]}]},
+            {"term": "a", "postings": [{"id": "d", "positions": [1]}]},
+        ]})
+        # Uppercase casefolds away; punctuation splits; ligature normalizes;
+        # whitespace splits into two tokens.
+        self.assert_rejected(self._one_term("A", [0]))
+        self.assert_rejected(self._one_term("a.b", [0, 1]))
+        self.assert_rejected(self._one_term("ﬁle", [0]))
+        self.assert_rejected(self._one_term("a b", [0, 1]))
+
+    def test_postings_nonempty_and_doc_references(self):
+        self.assert_rejected(
+            {"version": 1, "documents": ["d"],
+             "terms": [{"term": "a", "postings": []}]})
+        # Posting references a document absent from "documents".
+        self.assert_rejected({"version": 1, "documents": ["d"], "terms": [
+            {"term": "a", "postings": [{"id": "other", "positions": [0]}]}]})
+        self.assert_rejected({"version": 1, "documents": ["a", "b"], "terms": [
+            {"term": "x", "postings": [
+                {"id": "b", "positions": [0]},
+                {"id": "a", "positions": [0]},
+            ]},
+        ]})
+        self.assert_rejected({"version": 1, "documents": ["a"], "terms": [
+            {"term": "x", "postings": [
+                {"id": "a", "positions": [0]},
+                {"id": "a", "positions": [1]},
+            ]},
+        ]})
+
+    def test_position_rules(self):
+        self.assert_rejected(self._one_term("a", []))
+        self.assert_rejected(self._one_term("a", [True]))
+        self.assert_rejected(self._one_term("a", [-1]))
+        self.assert_rejected(self._one_term("a", [0.5]))
+        self.assert_rejected(self._one_term("a", [1, 0]))
+        self.assert_rejected(self._one_term("a", [0, 0]))
+        # Positions must be an array of the right element type.
+        self.assert_rejected({"version": 1, "documents": ["d"], "terms": [
+            {"term": "a", "postings": [{"id": "d", "positions": "0"}]}]})
+
+    def test_cross_term_coverage(self):
+        def two(a_pos, b_pos):
+            return {"version": 1, "documents": ["d"], "terms": [
+                {"term": "a",
+                 "postings": [{"id": "d", "positions": a_pos}]},
+                {"term": "b",
+                 "postings": [{"id": "d", "positions": b_pos}]},
+            ]}
+        # Same position claimed by two terms.
+        self.assert_rejected(two([0], [0]))
+        # Gap: union {0, 2} skips position 1.
+        self.assert_rejected(two([0], [2]))
+        # Coverage not starting at 0.
+        self.assert_rejected(self._one_term("a", [1]))
+
+    def test_valid_coverage_still_loads(self):
+        # {a:[0,2], b:[1]} is exactly what build emits for "a b a".
+        obj = {"version": 1, "documents": ["d"], "terms": [
+            {"term": "a", "postings": [{"id": "d", "positions": [0, 2]}]},
+            {"term": "b", "postings": [{"id": "d", "positions": [1]}]},
+        ]}
+        Snapshot.load(json.dumps(obj))
+
+    def test_malformed_shapes(self):
+        self.assert_rejected({"version": 1, "documents": [], "terms": [{}]})
+        self.assert_rejected({"version": 1, "documents": [], "terms": [
+            {"term": "a", "postings": "nope"}]})
+        self.assert_rejected({"version": 1, "documents": ["d"], "terms": [
+            {"term": "a", "postings": ["nope"]}]})
 
 
 class CliTests(unittest.TestCase):
@@ -257,6 +370,32 @@ class CliTests(unittest.TestCase):
         code, _, err = self.run_cli("search", other, "fox")
         self.assertEqual(code, 2)
         self.assertIn("error:", err)
+
+    def test_corrupt_snapshot_exit_2_no_partial_output(self):
+        self.run_cli("build", self.docs_path, self.snap_path)
+        with open(self.snap_path, encoding="utf-8") as fp:
+            obj = json.load(fp)
+        # Impossible internal structure: an empty positions posting would
+        # otherwise still let the term match the document.
+        obj["terms"][0]["postings"][0]["positions"] = []
+        bad = os.path.join(self.dir, "bad-snap.json")
+        with open(bad, "w", encoding="utf-8") as fp:
+            json.dump(obj, fp)
+        code, out, err = self.run_cli("search", bad, "fox")
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertTrue(err.splitlines()[0].startswith("error:"))
+        # A same-position conflict must be rejected the same way.
+        with open(self.snap_path, encoding="utf-8") as fp:
+            obj = json.load(fp)
+        obj["terms"][0]["postings"][0]["positions"] = [0]
+        obj["terms"][1]["postings"][0]["positions"] = [0]
+        with open(bad, "w", encoding="utf-8") as fp:
+            json.dump(obj, fp)
+        code, out, err = self.run_cli("search", bad, "fox")
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertTrue(err.splitlines()[0].startswith("error:"))
 
     def test_missing_input_exit_1(self):
         code, _, err = self.run_cli(
