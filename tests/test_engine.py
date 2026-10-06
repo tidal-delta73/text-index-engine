@@ -93,6 +93,100 @@ class BuildTests(unittest.TestCase):
         self.assert_data_error([good, good], "duplicate")
 
 
+class StreamingBuildTests(unittest.TestCase):
+    """build_from_lines on one-shot iterables, byte-compatible with v1."""
+
+    # Canonical bytes captured from the pre-refactor v1 builder for DOCS.
+    CANONICAL = (
+        b'{"version":1,"documents":["a","b","c","d","\xe4\xb8\xad"],"terms":['
+        b'{"term":"a","postings":[{"id":"b","positions":[0,4]}]},'
+        b'{"term":"and","postings":[{"id":"b","positions":[3]}]},'
+        b'{"term":"brown","postings":[{"id":"a","positions":[2]}]},'
+        b'{"term":"caf\xc3\xa9","postings":[{"id":"d","positions":[0,1]}]},'
+        b'{"term":"dog","postings":[{"id":"a","positions":[8]},'
+        b'{"id":"b","positions":[6]}]},'
+        b'{"term":"file","postings":[{"id":"d","positions":[2]}]},'
+        b'{"term":"fox","postings":[{"id":"a","positions":[3]},'
+        b'{"id":"b","positions":[2]}]},'
+        b'{"term":"jumps","postings":[{"id":"a","positions":[4]}]},'
+        b'{"term":"lazy","postings":[{"id":"a","positions":[7]}]},'
+        b'{"term":"over","postings":[{"id":"a","positions":[5]}]},'
+        b'{"term":"quick","postings":[{"id":"a","positions":[1]},'
+        b'{"id":"b","positions":[1,5]},'
+        b'{"id":"\xe4\xb8\xad","positions":[3]}]},'
+        b'{"term":"the","postings":[{"id":"a","positions":[0,6]}]},'
+        b'{"term":"\xe5\xbf\xab\xe7\x8b\x90","postings":['
+        b'{"id":"\xe4\xb8\xad","positions":[0]}]},'
+        b'{"term":"\xe6\x87\x92\xe7\x8b\x97","postings":['
+        b'{"id":"\xe4\xb8\xad","positions":[2]}]},'
+        b'{"term":"\xe8\xb7\xb3\xe8\xbf\x87","postings":['
+        b'{"id":"\xe4\xb8\xad","positions":[1]}]}]}\n'
+    )
+
+    def test_canonical_bytes_baseline(self):
+        self.assertEqual(build_from_lines(lines(DOCS)), self.CANONICAL)
+
+    def test_one_shot_iterables(self):
+        # No len, no indexing, no re-iteration: a plain generator and an
+        # iterator must both yield the canonical bytes.
+        gen = (line for line in lines(DOCS))
+        self.assertEqual(build_from_lines(gen), self.CANONICAL)
+        self.assertEqual(build_from_lines(iter(lines(DOCS))), self.CANONICAL)
+
+    def test_input_consumed_lazily_in_one_pass(self):
+        # The builder must not ask for len()/getitem or restart the input.
+        class OneShot:
+            def __init__(self, items):
+                self._it = iter(items)
+                self.pulls = 0
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                self.pulls += 1
+                return next(self._it)
+
+        src = OneShot(lines(DOCS))
+        self.assertEqual(build_from_lines(src), self.CANONICAL)
+        self.assertEqual(src.pulls, len(DOCS) + 1)  # exactly one pass
+
+    def test_shuffled_corpus_with_empty_docs(self):
+        # Empty-text doc "c" shuffled to the front; bytes stay canonical.
+        shuffled = [DOCS[2], DOCS[4], DOCS[1], DOCS[0], DOCS[3]]
+        self.assertEqual(build_from_lines(iter(lines(shuffled))),
+                         self.CANONICAL)
+        # A corpus of only empty/separator-only documents.
+        empties = [
+            {"id": "x", "text": ""},
+            {"id": "y", "text": "  - ! "},
+        ]
+        obj = json.loads(build_from_lines(iter(lines(empties))))
+        self.assertEqual(obj["documents"], ["x", "y"])
+        self.assertEqual(obj["terms"], [])
+
+    def test_late_failures_raise_without_partial_output(self):
+        good = lines(DOCS)
+        # Duplicate id on the last line of a one-shot generator.
+        dup = good + [json.dumps({"id": "a", "text": "again"}) + "\n"]
+        with self.assertRaises(DataError) as ctx:
+            build_from_lines(iter(dup))
+        self.assertIn(f"line {len(dup)}", str(ctx.exception))
+        self.assertIn("duplicate", str(ctx.exception))
+        # Malformed JSON on the last line.
+        bad_tail = good + ["{not json\n"]
+        with self.assertRaises(DataError) as ctx:
+            build_from_lines(iter(bad_tail))
+        self.assertIn(f"line {len(bad_tail)}", str(ctx.exception))
+        # Iterator that fails mid-stream: the exception propagates and no
+        # bytes are returned.
+        def dying():
+            yield good[0]
+            raise DataError("line 2: boom")
+        with self.assertRaises(DataError):
+            build_from_lines(dying())
+
+
 class SearchTests(unittest.TestCase):
     def setUp(self):
         self.snap = Snapshot.load(build_from_lines(lines(DOCS)))

@@ -51,15 +51,14 @@ def _cmd_build(args: list[str]) -> int:
         return 2
     input_path, output_path = args
     try:
+        # The file object itself is the one-shot line iterable; lines are
+        # consumed as the index is built, not buffered as a whole first.
         with open(input_path, "r", encoding="utf-8") as fp:
-            lines = fp.readlines()
+            data = build_from_lines(fp)
     except UnicodeDecodeError as exc:
         return _data_error(DataError(f"input is not valid UTF-8: {exc}"))
     except OSError as exc:
         return _io_error(exc)
-
-    try:
-        data = build_from_lines(lines)
     except DataError as exc:
         return _data_error(exc)
 
