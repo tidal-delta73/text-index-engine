@@ -111,85 +111,148 @@ def _lex(query: str) -> list[_Token]:
     return tokens
 
 
-class _Parser:
-    def __init__(self, tokens: list[_Token]):
-        self.tokens = tokens
-        self.pos = 0
-
-    def _peek(self) -> _Token:
-        return self.tokens[self.pos]
-
-    def _advance(self) -> _Token:
-        tok = self.tokens[self.pos]
-        self.pos += 1
-        return tok
-
-    def parse(self):
-        node = self._parse_or()
-        tok = self._peek()
-        if tok.kind != T_EOF:
-            if tok.kind == T_RPAREN:
-                raise DataError("query: unmatched ')'")
-            raise DataError("query: missing operator between operands")
-        return node
-
-    def _parse_or(self):
-        left = self._parse_and()
-        while self._peek().kind == T_OR:
-            self._advance()
-            right = self._parse_and()
-            left = ("or", left, right)
-        return left
-
-    def _parse_and(self):
-        left = self._parse_not()
-        while self._peek().kind == T_AND:
-            self._advance()
-            right = self._parse_not()
-            left = ("and", left, right)
-        return left
-
-    def _parse_not(self):
-        tok = self._peek()
-        if tok.kind == T_NOT:
-            self._advance()
-            return ("not", self._parse_not())
-        return self._parse_atom()
-
-    def _parse_atom(self):
-        tok = self._peek()
-        if tok.kind == T_TERM:
-            self._advance()
-            return ("term", tok.value)
-        if tok.kind == T_PREFIX:
-            self._advance()
-            return ("prefix", tok.value)
-        if tok.kind == T_PHRASE:
-            self._advance()
-            return ("phrase", tok.value)
-        if tok.kind == T_LPAREN:
-            self._advance()
-            if self._peek().kind == T_RPAREN:
-                raise DataError("query: missing operand inside parentheses")
-            node = self._parse_or()
-            closing = self._peek()
-            if closing.kind != T_RPAREN:
-                raise DataError("query: unbalanced parentheses")
-            self._advance()
-            return node
-        if tok.kind == T_RPAREN:
-            raise DataError("query: unmatched ')'")
-        if tok.kind == T_EOF:
-            raise DataError("query: missing operand")
-        raise DataError(f"query: unexpected token {tok.value!r}")
+# Operator precedences: NOT > AND > OR. AND/OR are left associative; NOT is
+# right associative (it binds the operand to its right).
+_OP_PRECEDENCE = {T_NOT: 3, T_AND: 2, T_OR: 1}
 
 
 def parse(query: str):
-    """Parse a query string into an AST. Empty/whitespace-only returns None."""
+    """Parse a query string into an AST. Empty/whitespace-only returns None.
+
+    Uses the shunting-yard algorithm on a flat token list, so usable query
+    depth (chains of NOT, nested parentheses, long AND/OR chains) is bounded
+    by memory rather than the interpreter recursion limit. The RPN produced
+    is folded into the exact nested tuple tree a recursive-descent parser for
+    the grammar would build: ``("not", x)``, ``("and", l, r)``,
+    ``("or", l, r)`` and leaves ``("term"|"prefix"|"phrase", value)``.
+    """
     tokens = _lex(query)
     if len(tokens) == 1:  # only EOF
         return None
-    return _Parser(tokens).parse()
+
+    # Shunting-yard. ops holds pending (precedence, kind) operators plus
+    # LPAREN markers. Each parens frame records the state of one parenthesised
+    # group so the recursive parser's diagnostics survive at any depth:
+    #   0 = no token consumed yet since "("
+    #   2 = prefix tokens (NOT) consumed, operand still missing
+    #   1 = a complete operand present
+    ops: list[tuple] = []
+    output: list[tuple] = []
+    parens: list[int] = []
+    expect_operand = True
+    pos = 0
+    n = len(tokens)
+    while pos < n:
+        tok = tokens[pos]
+        kind = tok.kind
+        if kind == T_EOF:
+            break
+        if kind == T_LPAREN:
+            if not expect_operand:
+                # Adjacency with a group: "(foo (bar))" stays inside the open
+                # group and reads as unbalanced, while "foo (bar)" at the top
+                # level is two operands without an operator.
+                if parens:
+                    raise DataError("query: unbalanced parentheses")
+                raise DataError("query: missing operator between operands")
+            parens.append(0)
+            ops.append((0, T_LPAREN))
+            pos += 1
+            continue
+        if kind == T_RPAREN:
+            if not parens:
+                raise DataError("query: unmatched ')'")
+            frame = parens[-1]
+            if frame == 0:
+                # "()", "(())": nothing at all between the parens.
+                raise DataError("query: missing operand inside parentheses")
+            if expect_operand:
+                # "(foo AND)", "(NOT)", "(": a prefix/binary was consumed but
+                # its operand is missing; the recursive parser reaches the
+                # ")" at an atom position and reports an unmatched paren.
+                raise DataError("query: unmatched ')'")
+            while ops[-1][1] != T_LPAREN:
+                output.append(("op", ops.pop()[1]))
+            ops.pop()  # discard the LPAREN marker
+            parens.pop()
+            if parens:
+                parens[-1] = 1
+            pos += 1
+            continue
+        if kind == T_NOT:
+            if expect_operand:
+                ops.append((_OP_PRECEDENCE[T_NOT], T_NOT))
+                if parens and parens[-1] == 0:
+                    parens[-1] = 2
+                pos += 1
+                continue
+            # "foo NOT bar": NOT where a binary operator was expected. Inside
+            # an open group the recursive parser's closing-token check reports
+            # unbalanced parentheses; at top level it is missing adjacency.
+            if parens:
+                raise DataError("query: unbalanced parentheses")
+            raise DataError("query: missing operator between operands")
+        if kind in (T_AND, T_OR):
+            # A binary keyword where an operand was required: "AND foo",
+            # "NOT AND", "(OR bar)". The recursive atom reports the token.
+            if expect_operand:
+                raise DataError(f"query: unexpected token {tok.value!r}")
+            incoming = _OP_PRECEDENCE[kind]
+            # Left associative: flush equal-or-higher precedence pending
+            # operators, stopping at the enclosing group marker. NOT (3) is
+            # always higher than AND/OR, so it binds its operand first.
+            while ops and ops[-1][1] != T_LPAREN and ops[-1][0] >= incoming:
+                output.append(("op", ops.pop()[1]))
+            ops.append((incoming, kind))
+            expect_operand = True
+            pos += 1
+            continue
+        # A leaf token (TERM/PREFIX/PHRASE).
+        if not expect_operand:
+            # "(foo bar)" stays inside its group and is reported there;
+            # "foo bar" at top level is missing an explicit operator.
+            if parens:
+                raise DataError("query: unbalanced parentheses")
+            raise DataError("query: missing operator between operands")
+        if kind == T_TERM:
+            output.append(("term", tok.value))
+        elif kind == T_PREFIX:
+            output.append(("prefix", tok.value))
+        else:
+            output.append(("phrase", tok.value))
+        if parens:
+            parens[-1] = 1
+        expect_operand = False
+        pos += 1
+
+    if expect_operand:
+        # "NOT", "foo AND", "(", "(((" , "(foo AND": an operand was still
+        # missing when input ran out, exactly the recursive atom's EOF case.
+        raise DataError("query: missing operand")
+    if parens:
+        # A complete expression with an unclosed group: "(foo", "((foo)".
+        raise DataError("query: unbalanced parentheses")
+    while ops:
+        output.append(("op", ops.pop()[1]))
+
+    # Fold the flat RPN into the nested AST, iteratively.
+    stack: list = []
+    for elem in output:
+        if elem[0] == "op":
+            op = elem[1]
+            if op == T_NOT:
+                stack.append(("not", stack.pop()))
+            else:
+                right = stack.pop()
+                left = stack.pop()
+                stack.append(("and" if op == T_AND else "or", left, right))
+        else:
+            stack.append(elem)
+
+    if len(stack) != 1:
+        # Defensive: operand/operator balance is enforced while scanning.
+        raise DataError("query: missing operand")
+    return stack[0]
 
 
 def _phrase_docs(snapshot, words: list[str]) -> set[str]:
@@ -229,9 +292,8 @@ def _prefix_docs(snapshot, prefix: str) -> set[str]:
     return hits
 
 
-def evaluate(node, snapshot) -> set[str]:
+def _leaf_docs(node, snapshot) -> set[str]:
     kind = node[0]
-    universe = snapshot.all_docs
     if kind == "term":
         posting = snapshot.postings.get(node[1])
         return set(posting) if posting is not None else set()
@@ -239,10 +301,47 @@ def evaluate(node, snapshot) -> set[str]:
         return _prefix_docs(snapshot, node[1])
     if kind == "phrase":
         return _phrase_docs(snapshot, node[1])
-    if kind == "not":
-        return set(universe) - evaluate(node[1], snapshot)
-    if kind == "and":
-        return evaluate(node[1], snapshot) & evaluate(node[2], snapshot)
-    if kind == "or":
-        return evaluate(node[1], snapshot) | evaluate(node[2], snapshot)
     raise DataError(f"query: internal error, unknown node {kind!r}")
+
+
+def evaluate(node, snapshot) -> set[str]:
+    """Evaluate a parsed query against a snapshot, returning a doc-id set.
+
+    The walk uses explicit stacks rather than Python call frames, so query
+    depth is bounded by memory like parsing. Semantics are identical to the
+    former recursive evaluator: leaves resolve to posting sets, AND/OR are
+    set intersection/union with the tree's left-associative grouping, and NOT
+    is the complement against the snapshot's full document set.
+    """
+    universe = snapshot.all_docs
+    # Pending (node, phase) frames: phase 0 visits children first, phase 1
+    # combines their already-computed sets. ``values`` holds the results.
+    work: list[tuple] = [(node, 0)]
+    values: list[set[str]] = []
+    while work:
+        cur, phase = work.pop()
+        kind = cur[0]
+        if kind in ("term", "prefix", "phrase"):
+            values.append(_leaf_docs(cur, snapshot))
+            continue
+        if kind == "not":
+            if phase == 0:
+                work.append((cur, 1))
+                work.append((cur[1], 0))
+            else:
+                values.append(set(universe) - values.pop())
+            continue
+        if kind in ("and", "or"):
+            if phase == 0:
+                # Right is pushed first so the left subtree evaluates first;
+                # results then land on ``values`` in left-then-right order.
+                work.append((cur, 1))
+                work.append((cur[2], 0))
+                work.append((cur[1], 0))
+            else:
+                right = values.pop()
+                left = values.pop()
+                values.append(left & right if kind == "and" else left | right)
+            continue
+        raise DataError(f"query: internal error, unknown node {kind!r}")
+    return values[0]

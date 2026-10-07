@@ -749,5 +749,151 @@ class CliTests(unittest.TestCase):
             self.assertTrue(err.splitlines()[0].startswith("error:"), bad)
 
 
+class DeepQueryTests(unittest.TestCase):
+    """Depth is bounded by the query language, not the recursion limit."""
+
+    N = 10000
+    LOW_LIMIT = 100
+
+    def setUp(self):
+        self.snap = Snapshot.load(build_from_lines(lines(DOCS)))
+
+    def _eval(self, q):
+        node = query.parse(q)
+        return sorted(query.evaluate(node, self.snap)) if node is not None else []
+
+    def _with_low_limit(self, fn):
+        saved = sys.getrecursionlimit()
+        sys.setrecursionlimit(self.LOW_LIMIT)
+        try:
+            return fn()
+        finally:
+            sys.setrecursionlimit(saved)
+
+    def test_deep_not_chain(self):
+        fox = ["a", "b"]
+        not_fox = ["c", "d", "中"]
+        # An even chain is the identity; an odd one is the complement.
+        self.assertEqual(
+            self._with_low_limit(lambda: self._eval("NOT " * self.N + "fox")),
+            fox)
+        self.assertEqual(
+            self._with_low_limit(
+                lambda: self._eval("NOT " * (self.N + 1) + "fox")),
+            not_fox)
+        # Repeated evaluation is stable.
+        q = "NOT " * (self.N + 1) + "fox"
+        self.assertEqual(
+            self._with_low_limit(lambda: self._eval(q)),
+            self._with_low_limit(lambda: self._eval(q)))
+
+    def test_deep_parentheses(self):
+        n = self.N
+        self.assertEqual(
+            self._with_low_limit(
+                lambda: self._eval("(" * n + "fox" + ")" * n)),
+            ["a", "b"])
+        # Parentheses still override precedence when buried deeply.
+        self.assertEqual(
+            self._with_low_limit(lambda: self._eval(
+                "fox OR " + "(" * n + "(quick AND dog)" + ")" * n)),
+            self._eval("fox OR (quick AND dog)"))
+        self.assertEqual(
+            self._with_low_limit(lambda: self._eval(
+                "(" * n + "(fox OR quick) AND dog" + ")" * n)),
+            self._eval("(fox OR quick) AND dog"))
+
+    def test_deep_binary_chains(self):
+        n = self.N
+        self.assertEqual(
+            self._with_low_limit(
+                lambda: self._eval("fox" + " AND fox" * (n - 1))),
+            ["a", "b"])
+        self.assertEqual(
+            self._with_low_limit(
+                lambda: self._eval("zzz" + " OR fox" * (n - 1))),
+            ["a", "b"])
+        self.assertEqual(
+            self._with_low_limit(
+                lambda: self._eval("fox" + " AND zzz" * (n - 1))),
+            [])
+        # Equivalent short and long spellings agree.
+        self.assertEqual(
+            self._with_low_limit(
+                lambda: self._eval("fox" + " OR fox" * (n - 1))),
+            self._eval("fox OR fox"))
+
+    def test_deep_mixed_structure(self):
+        n = self.N // 2
+        self.assertEqual(
+            self._with_low_limit(lambda: self._eval(
+                "(" * n + 'NOT "quick fox" OR qu*' + ")" * n)),
+            self._eval('(NOT "quick fox" OR qu*)'))
+        # NOT over an absent term deep inside still yields the universe.
+        universe = ["a", "b", "c", "d", "中"]
+        self.assertEqual(
+            self._with_low_limit(
+                lambda: self._eval("NOT " * (self.N + 1) + "zzz")),
+            universe)
+        self.assertIn(
+            "c",
+            set(self._with_low_limit(lambda: self._eval(
+                "(" * self.N + "NOT fox" + ")" * self.N))))
+
+    def test_deep_malformed_raises_exactly_data_error(self):
+        n = self.N
+        bad = [
+            "(" * n + "fox",                              # unclosed group
+            "(" * n + "fox" + ")" * (n - 1),              # one close short
+            "(" * n + "fox AND" + ")" * n,                # trailing operator
+            "NOT " * n,                                   # missing operand
+            "(" * n + "fox dog" + ")" * n,                # adjacent operands
+            "(" * n + 'fox AND "unterminated',            # open phrase at depth
+            "(" * n + "NOT" + ")" * n,                    # NOT then close
+            "(" * n + "()" + ")" * (n - 1),               # empty group deep
+            "(" * n + "AND fox" + ")" * n,                # binary first
+            "fox" + " AND fox" * (n - 1) + " AND",        # trailing chain op
+        ]
+
+        def run_all():
+            for q in bad:
+                try:
+                    node = query.parse(q)
+                    if node is not None:
+                        query.evaluate(node, self.snap)
+                except DataError as exc:
+                    self.assertIs(type(exc), DataError)
+                    continue
+                self.fail(f"deep malformed query was accepted: {q[:20]!r}")
+
+        self._with_low_limit(run_all)
+
+    def test_deep_malformed_cli_exit_2(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        snap_path = os.path.join(tmp.name, "snap.json")
+        with open(os.path.join(tmp.name, "docs.jsonl"), "w",
+                  encoding="utf-8") as fp:
+            for line in lines(DOCS):
+                fp.write(line)
+        code = main(["build",
+                     os.path.join(tmp.name, "docs.jsonl"),
+                     snap_path])
+        self.assertEqual(code, 0)
+        n = self.N
+        for bad in ("(" * n + "fox",
+                    "NOT " * n,
+                    "(" * n + "fox AND" + ")" * n,
+                    "(" * n + '"unterminated'):
+            out, err_buf = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err_buf):
+                code = main(["search", snap_path, bad])
+            self.assertEqual(code, 2, bad[:20])
+            self.assertEqual(out.getvalue(), "", bad[:20])
+            self.assertTrue(
+                err_buf.getvalue().splitlines()[0].startswith("error:"),
+                bad[:20])
+
+
 if __name__ == "__main__":
     unittest.main()
