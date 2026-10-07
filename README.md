@@ -11,6 +11,7 @@ python3 -m text_index_engine version
 python3 -m text_index_engine help
 python3 -m text_index_engine build <input.jsonl> <snapshot>
 python3 -m text_index_engine search <snapshot> "<query>"
+python3 -m text_index_engine rank <snapshot> "<query>"
 ```
 
 ### build
@@ -69,6 +70,35 @@ Examples:
 python3 -m text_index_engine search idx.snap 'fox AND NOT "lazy dog"'
 python3 -m text_index_engine search idx.snap '(quick OR fast) AND fox'
 python3 -m text_index_engine search idx.snap 'NOT app* OR "new york"'
+```
+
+### rank
+
+Takes the same query language and the same snapshot as `search`, and prints a
+compact JSON array of the boolean query's candidate documents, each as
+`{"id": ..., "score": ...}` with a fixed six-decimal decimal string. Results
+are ordered by score descending; equal scores tie-break by document id in
+Unicode code point order. An empty query or an empty candidate set prints
+`[]`. Only the snapshot is read.
+
+Scoring uses BM25 with k1 = 1.2 and b = 0.75:
+
+```
+idf   = ln(1 + (N - df + 0.5) / (df + 0.5))
+score = idf * tf * (k1 + 1) / (tf + k1 * (1 - b + b * dl / avgdl))
+```
+
+N counts every document in the snapshot (including empty ones), dl is the
+document's total token count, and avgdl averages over every document. Only
+positive leaves — leaves under an even number of `NOT`s — contribute. A term
+leaf contributes its term, a phrase leaf contributes each phrase word (no
+phrase bonus), and a prefix leaf contributes every dictionary term it expands
+to; repeated occurrences accumulate. Leaves under an odd number of `NOT`s
+still filter candidates but never score, so a valid query without positive
+leaves (e.g. `NOT fox`) returns its hits at score `0.000000`.
+
+```bash
+python3 -m text_index_engine rank idx.snap '(quick OR fast) AND fox'
 ```
 
 ## Exit codes
