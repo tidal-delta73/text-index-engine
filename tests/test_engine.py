@@ -1,6 +1,7 @@
 """End-to-end and unit tests for the build/search vertical slice."""
 import io
 import json
+import math
 import os
 import sys
 import tempfile
@@ -11,6 +12,7 @@ from text_index_engine import query
 from text_index_engine.analysis import tokenize
 from text_index_engine.__main__ import main
 from text_index_engine.errors import DataError
+from text_index_engine.rank import rank
 from text_index_engine.snapshot import Snapshot, build_from_lines
 
 DOCS = [
@@ -747,6 +749,274 @@ class CliTests(unittest.TestCase):
             self.assertEqual(code, 2, bad)
             self.assertEqual(out, "", bad)
             self.assertTrue(err.splitlines()[0].startswith("error:"), bad)
+
+
+def bm25_expected(snap_obj, terms, candidates, k1=1.2, b=0.75):
+    """Independent BM25 expectation derived from the v1 snapshot object.
+
+    Reads only the documented snapshot format (documents/terms/postings) and
+    applies the public formula; never calls text_index_engine.rank.
+    ``terms`` is the hand-listed multiset of contributing term occurrences.
+    """
+    doc_ids = snap_obj["documents"]
+    n = len(doc_ids)
+    postings = {t["term"]: {p["id"]: p["positions"] for p in t["postings"]}
+                for t in snap_obj["terms"]}
+    dl = {d: 0 for d in doc_ids}
+    for posting in postings.values():
+        for d, positions in posting.items():
+            dl[d] += len(positions)
+    avgdl = sum(dl.values()) / n if n else 0
+    rows = []
+    for d in candidates:
+        total = 0.0
+        if avgdl > 0:
+            for term in terms:
+                df = len(postings.get(term, {}))
+                idf = math.log(1 + (n - df + 0.5) / (df + 0.5))
+                tf = len(postings.get(term, {}).get(d, []))
+                total += idf * tf * (k1 + 1) / (tf + k1 * (1 - b + b * dl[d]
+                                                          / avgdl))
+        rows.append((d, f"{total:.6f}"))
+    rows.sort(key=lambda row: (-float(row[1]), row[0]))
+    return [{"id": d, "score": s} for d, s in rows]
+
+
+class RankTests(unittest.TestCase):
+    def setUp(self):
+        self.snap_obj = json.loads(build_from_lines(lines(DOCS)))
+        self.snap = Snapshot.load(json.dumps(self.snap_obj, ensure_ascii=False))
+
+    def run_rank(self, q):
+        node = query.parse(q)
+        return rank(node, self.snap) if node is not None else []
+
+    def assert_rank(self, q, terms, candidates):
+        expected = bm25_expected(self.snap_obj, terms, candidates)
+        self.assertEqual(self.run_rank(q), expected)
+        return expected
+
+    def test_single_term_scores_match_formula(self):
+        expected = self.assert_rank("quick", ["quick"], ["a", "b", "中"])
+        # Scores are genuine BM25 values: all three differ here (dl and tf
+        # vary), are positive and carry exactly six decimals.
+        scores = [row["score"] for row in expected]
+        self.assertEqual(len(set(scores)), 3)
+        for row in expected:
+            self.assertRegex(row["score"], r"^\d+\.\d{6}$")
+            self.assertGreater(float(row["score"]), 0.0)
+        # Higher tf wins: b has quick twice, a and 中 once; a is longer
+        # than 中, so 中 outranks a.
+        self.assertEqual([row["id"] for row in expected], ["b", "中", "a"])
+
+    def test_empty_query_and_empty_candidates(self):
+        self.assertEqual(self.run_rank(""), [])
+        self.assertEqual(self.run_rank("   "), [])
+        self.assertEqual(self.run_rank("zzz"), [])
+        self.assertEqual(self.run_rank("zzz*"), [])
+
+    def test_not_only_query_scores_zero_in_id_order(self):
+        # No positive leaf: every candidate scores 0.000000, id ordered.
+        self.assertEqual(
+            self.run_rank("NOT fox"),
+            [{"id": "c", "score": "0.000000"},
+             {"id": "d", "score": "0.000000"},
+             {"id": "中", "score": "0.000000"}],
+        )
+
+    def test_even_not_depth_scores_like_positive(self):
+        self.assertEqual(self.run_rank("NOT NOT quick"), self.run_rank("quick"))
+        self.assertEqual(
+            self.run_rank("NOT NOT NOT NOT fox"), self.run_rank("fox"))
+
+    def test_odd_not_leaf_filters_but_never_scores(self):
+        # Candidates: quick docs minus fox docs = {中}; only quick scores.
+        self.assert_rank("quick AND NOT fox", ["quick"], ["中"])
+        # NOT over a group: every leaf inside is at odd depth.
+        self.assert_rank("quick AND NOT (fox OR café)", ["quick"], ["中"])
+
+    def test_phrase_contributes_each_word_without_bonus(self):
+        self.assert_rank('"quick fox"', ["quick", "fox"], ["b"])
+        # A one-word phrase scores exactly like the bare term.
+        self.assertEqual(self.run_rank('"quick"'), self.run_rank("quick"))
+
+    def test_prefix_contributes_each_expanded_term(self):
+        # qu* expands to exactly "quick".
+        self.assert_rank("qu*", ["quick"], ["a", "b", "中"])
+        # f* expands to file and fox; the union matches a, b and d.
+        self.assert_rank("f*", ["file", "fox"], ["a", "b", "d"])
+        # A prefix matching no dictionary term has no scoring terms at all.
+        self.assertEqual(
+            self.run_rank("NOT zzz*"),
+            [{"id": d, "score": "0.000000"} for d in ["a", "b", "c", "d", "中"]],
+        )
+
+    def test_repeated_term_occurrences_accumulate(self):
+        single = self.run_rank("quick")
+        double = self.run_rank("quick OR quick")
+        self.assertEqual([r["id"] for r in single], [r["id"] for r in double])
+        # Exact strings checked against the independent formula: each
+        # occurrence of the same term scores again.
+        self.assert_rank("quick OR quick", ["quick", "quick"], ["a", "b", "中"])
+
+    def test_ties_break_by_document_id_codepoint_order(self):
+        docs = [{"id": "b", "text": "fox"}, {"id": "a", "text": "fox"},
+                {"id": "中", "text": "fox"}]
+        snap = Snapshot.load(build_from_lines(lines(docs)))
+        rows = rank(query.parse("fox"), snap)
+        self.assertEqual([r["id"] for r in rows], ["a", "b", "中"])
+        self.assertTrue(all(r["score"] == rows[0]["score"] for r in rows))
+
+    def test_avgdl_zero_scores_all_candidates_zero(self):
+        docs = [{"id": "x", "text": ""}, {"id": "y", "text": "  - ! "}]
+        snap = Snapshot.load(build_from_lines(lines(docs)))
+        self.assertEqual(
+            rank(query.parse("NOT fox"), snap),
+            [{"id": "x", "score": "0.000000"},
+             {"id": "y", "score": "0.000000"}],
+        )
+        # A term query has no candidates at all.
+        self.assertEqual(rank(query.parse("fox"), snap), [])
+
+    def test_n_zero_returns_empty(self):
+        snap = Snapshot.load(build_from_lines([]))
+        self.assertEqual(rank(query.parse("fox"), snap), [])
+        self.assertEqual(rank(query.parse("NOT fox"), snap), [])
+
+    def test_old_v1_snapshot_ranks_without_rebuild(self):
+        obj = {
+            "version": 1,
+            "documents": ["d1", "d2"],
+            "terms": [
+                {"term": "app",
+                 "postings": [{"id": "d1", "positions": [0]}]},
+                {"term": "apple",
+                 "postings": [{"id": "d2", "positions": [0]}]},
+                {"term": "banana",
+                 "postings": [{"id": "d1", "positions": [1]}]},
+            ],
+        }
+        snap = Snapshot.load(json.dumps(obj, ensure_ascii=False))
+        rows = rank(query.parse("app*"), snap)
+        # app* expands to app and apple; d1 scores via app, d2 via apple.
+        self.assertEqual(rows, bm25_expected(obj, ["app", "apple"],
+                                             ["d1", "d2"]))
+        self.assertEqual([r["id"] for r in rows], ["d2", "d1"])  # dl 1 < 2
+        self.assertEqual(
+            rank(query.parse("banana"), snap),
+            bm25_expected(obj, ["banana"], ["d1"]))
+
+    def test_deep_not_chain_parity_at_low_recursion_limit(self):
+        saved = sys.getrecursionlimit()
+        sys.setrecursionlimit(100)
+        try:
+            even = rank(query.parse("NOT " * 10000 + "quick"), self.snap)
+            odd = rank(query.parse("NOT " * 10001 + "quick"), self.snap)
+        finally:
+            sys.setrecursionlimit(saved)
+        self.assertEqual(even, self.run_rank("quick"))
+        self.assertEqual(
+            odd, [{"id": d, "score": "0.000000"} for d in ["c", "d"]])
+
+
+class RankCliTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = self.tmp.name
+        self.docs_path = os.path.join(self.dir, "docs.jsonl")
+        self.snap_path = os.path.join(self.dir, "snap.json")
+        with open(self.docs_path, "w", encoding="utf-8") as fp:
+            for line in lines(DOCS):
+                fp.write(line)
+        code, _, err = self.run_cli(
+            "build", self.docs_path, self.snap_path)
+        self.assertEqual(code, 0, err)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_cli(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = main(list(argv))
+        return code, out.getvalue(), err.getvalue()
+
+    def test_help_lists_rank(self):
+        for help_arg in ("help", "-h", "--help"):
+            code, out, _ = self.run_cli(help_arg)
+            self.assertEqual(code, 0)
+            self.assertIn("rank <snapshot>", out)
+
+    def test_rank_output_shape_and_trailing_newline(self):
+        code, out, err = self.run_cli("rank", self.snap_path, "quick")
+        self.assertEqual(code, 0, err)
+        self.assertTrue(out.endswith("\n") and out.count("\n") == 1)
+        rows = json.loads(out)
+        self.assertEqual([r["id"] for r in rows], ["b", "中", "a"])
+        for row in rows:
+            self.assertEqual(sorted(row), ["id", "score"])
+            self.assertRegex(row["score"], r"^\d+\.\d{6}$")
+        # Compact separators, id before score, non-ASCII kept literal.
+        self.assertTrue(out.startswith('[{"id":"b","score":"'))
+        self.assertIn('"id":"中"', out)
+
+    def test_rank_byte_stable_and_matches_module(self):
+        _, out1, _ = self.run_cli("rank", self.snap_path, "f* OR café")
+        _, out2, _ = self.run_cli("rank", self.snap_path, "f* OR café")
+        self.assertEqual(out1, out2)
+        snap = Snapshot.load(build_from_lines(lines(DOCS)))
+        module_rows = rank(query.parse("f* OR café"), snap)
+        self.assertEqual(json.loads(out1), module_rows)
+
+    def test_rank_empty_query_and_no_hits_print_empty_array(self):
+        for q in ("", "zzz"):
+            code, out, err = self.run_cli("rank", self.snap_path, q)
+            self.assertEqual(code, 0, err)
+            self.assertEqual(out, "[]\n")
+
+    def test_rank_not_only_query_zero_scores(self):
+        code, out, err = self.run_cli("rank", self.snap_path, "NOT fox")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(
+            json.loads(out),
+            [{"id": "c", "score": "0.000000"},
+             {"id": "d", "score": "0.000000"},
+             {"id": "中", "score": "0.000000"}],
+        )
+
+    def test_rank_wrong_arg_count_exit_2(self):
+        for argv in (("rank",), ("rank", "only-one"),
+                     ("rank", "a", "b", "c")):
+            code, out, err = self.run_cli(*argv)
+            self.assertEqual(code, 2, argv)
+            self.assertEqual(out, "", argv)
+            self.assertTrue(err.splitlines()[0].startswith("error:"), argv)
+
+    def test_rank_query_error_exit_2_no_partial_output(self):
+        for bad in ("fox AND", "*", '"unterminated', "()", "fox dog"):
+            code, out, err = self.run_cli("rank", self.snap_path, bad)
+            self.assertEqual(code, 2, bad)
+            self.assertEqual(out, "", bad)
+            self.assertTrue(err.splitlines()[0].startswith("error:"), bad)
+
+    def test_rank_corrupt_snapshot_exit_2(self):
+        with open(self.snap_path, encoding="utf-8") as fp:
+            obj = json.load(fp)
+        obj["version"] = 42
+        bad = os.path.join(self.dir, "bad.json")
+        with open(bad, "w", encoding="utf-8") as fp:
+            json.dump(obj, fp)
+        code, out, err = self.run_cli("rank", bad, "fox")
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertTrue(err.splitlines()[0].startswith("error:"))
+
+    def test_rank_missing_snapshot_exit_1(self):
+        code, out, err = self.run_cli(
+            "rank", os.path.join(self.dir, "nope.json"), "fox")
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertTrue(err.splitlines()[0].startswith("error:"))
 
 
 class DeepQueryTests(unittest.TestCase):

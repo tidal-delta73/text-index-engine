@@ -5,6 +5,7 @@ Commands:
   help                             print this message
   build <input.jsonl> <snapshot>   build a deterministic inverted snapshot
   search <snapshot> "<query>"      run one boolean query against a snapshot
+  rank <snapshot> "<query>"        BM25-rank the query's candidate documents
 
 Exit codes: 0 success, 1 filesystem error (missing/unreadable input,
 unwritable output), 2 invalid data (documents, snapshot or query). On error
@@ -17,6 +18,7 @@ import sys
 from . import __version__
 from .errors import DataError
 from .query import evaluate, parse
+from .rank import rank
 from .snapshot import Snapshot, build_from_lines, write_atomic
 
 USAGE = """usage: python3 -m text_index_engine <command>
@@ -26,6 +28,7 @@ commands:
   help                                    print this message
   build <input.jsonl> <snapshot>          build an inverted-index snapshot
   search <snapshot> "<query>"             query a snapshot
+  rank <snapshot> "<query>"               BM25-rank the query's candidates
 
 exit codes:
   0  success
@@ -94,6 +97,30 @@ def _cmd_search(args: list[str]) -> int:
     return 0
 
 
+def _cmd_rank(args: list[str]) -> int:
+    if len(args) != 2:
+        print("error: rank requires <snapshot> path and one query string",
+              file=sys.stderr)
+        return 2
+    snapshot_path, query = args
+    try:
+        with open(snapshot_path, "rb") as fp:
+            raw = fp.read()
+    except OSError as exc:
+        return _io_error(exc)
+
+    try:
+        snapshot = Snapshot.load(raw)
+        node = parse(query)
+        result = [] if node is None else rank(node, snapshot)
+        output = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+    except DataError as exc:
+        return _data_error(exc)
+
+    sys.stdout.write(output + "\n")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     command = args[0] if args else "help"
@@ -107,6 +134,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_build(args[1:])
     if command == "search":
         return _cmd_search(args[1:])
+    if command == "rank":
+        return _cmd_rank(args[1:])
     print(f"unknown command: {command}", file=sys.stderr)
     print(USAGE, end="", file=sys.stderr)
     return 2

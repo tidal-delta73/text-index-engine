@@ -11,6 +11,7 @@ python3 -m text_index_engine version
 python3 -m text_index_engine help
 python3 -m text_index_engine build <input.jsonl> <snapshot>
 python3 -m text_index_engine search <snapshot> "<query>"
+python3 -m text_index_engine rank <snapshot> "<query>"
 ```
 
 ### build
@@ -70,6 +71,34 @@ python3 -m text_index_engine search idx.snap 'fox AND NOT "lazy dog"'
 python3 -m text_index_engine search idx.snap '(quick OR fast) AND fox'
 python3 -m text_index_engine search idx.snap 'NOT app* OR "new york"'
 ```
+
+### rank
+
+Same snapshot, query language and candidate set as `search`, but the
+matching documents are scored with BM25 and printed as a compact JSON array
+of `{"id": ..., "score": "..."}` objects — score descending, ties broken by
+document id in code point order, one trailing newline. The score is a fixed
+six-decimal string (rounded half to even; never NaN, Infinity or negative
+zero). An empty query or empty candidate set prints `[]`.
+
+Only the query tree's *positive* leaves (those under an even number of
+`NOT`s) score; leaves under an odd `NOT` count still filter candidates but
+contribute nothing — so `NOT fox` ranks its candidates with all-zero scores
+in id order. A term contributes itself, a phrase contributes each of its
+words (no phrase bonus), a prefix contributes every dictionary term it
+expands to, and repeated occurrences of a term accumulate. With `N` the
+snapshot's document count, `dl` a document's position total and `avgdl` the
+mean position total over all documents (empty ones included):
+
+```
+idf   = ln(1 + (N - df + 0.5) / (df + 0.5))
+score = idf * tf * (k1 + 1) / (tf + k1 * (1 - b + b * dl / avgdl))
+k1 = 1.2, b = 0.75
+```
+
+`avgdl == 0` scores every candidate `0.000000`. Ranking reads only the
+snapshot — never the original documents — and any v1 snapshot serves it
+without a rebuild.
 
 ## Exit codes
 
